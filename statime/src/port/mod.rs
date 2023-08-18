@@ -182,11 +182,12 @@ impl<'a, C: Clock, F: Filter, R: Rng> Port<Running<'a>, R, C, F> {
     }
 
     // Handle the announce timer going of
-    pub fn handle_announce_timer(&mut self) -> PortActionIterator<'_> {
+    pub fn handle_announce_timer(&mut self, tlv_set: TlvSet<'_>) -> PortActionIterator<'_> {
         self.port_state.send_announce(
             self.lifecycle.state.deref(),
             &self.config,
             self.port_identity,
+            tlv_set,
             &mut self.packet_buffer,
         )
     }
@@ -233,11 +234,11 @@ impl<'a, C: Clock, F: Filter, R: Rng> Port<Running<'a>, R, C, F> {
     }
 
     // Handle a message over the timecritical channel
-    pub fn handle_timecritical_receive(
-        &mut self,
-        data: &[u8],
+    pub fn handle_timecritical_receive<'b>(
+        &'b mut self,
+        data: &'b [u8],
         timestamp: Time,
-    ) -> PortActionIterator {
+    ) -> PortActionIterator<'b> {
         let message = match Message::deserialize(data) {
             Ok(message) => message,
             Err(error) => {
@@ -287,7 +288,7 @@ impl<'a, C: Clock, F: Filter, R: Rng> Port<Running<'a>, R, C, F> {
         self.handle_general_internal(message)
     }
 
-    fn handle_general_internal(&mut self, message: Message<'_>) -> PortActionIterator<'_> {
+    fn handle_general_internal<'b>(&mut self, message: Message<'b>) -> PortActionIterator<'b> {
         match message.body {
             MessageBody::Announce(announce) => {
                 self.bmca
