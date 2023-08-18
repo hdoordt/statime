@@ -12,7 +12,7 @@ use crate::{
     clock::Clock,
     config::PortConfig,
     datastructures::{
-        common::{LeapIndicator, PortIdentity, TimeSource},
+        common::{LeapIndicator, PortIdentity, TimeSource, TlvSet, WireTimestamp},
         datasets::{CurrentDS, DefaultDS, ParentDS, TimePropertiesDS},
         messages::{Message, MessageBody},
     },
@@ -117,6 +117,10 @@ pub enum PortAction<'a> {
     },
     ResetFilterUpdateTimer {
         duration: core::time::Duration,
+    },
+    PropagateTlv {
+        tlv_set: TlvSet<'a>,
+        current_time: WireTimestamp,
     },
 }
 
@@ -264,7 +268,7 @@ impl<'a, C: Clock, F: Filter, R: Rng> Port<Running<'a>, R, C, F> {
     }
 
     // Handle a general ptp message
-    pub fn handle_general_receive(&mut self, data: &[u8]) -> PortActionIterator {
+    pub fn handle_general_receive<'b>(&mut self, data: &'b [u8]) -> PortActionIterator<'b> {
         let message = match Message::deserialize(data) {
             Ok(message) => message,
             Err(error) => {
@@ -288,9 +292,20 @@ impl<'a, C: Clock, F: Filter, R: Rng> Port<Running<'a>, R, C, F> {
             MessageBody::Announce(announce) => {
                 self.bmca
                     .register_announce_message(&message.header, &announce);
-                actions![PortAction::ResetAnnounceReceiptTimer {
+
+                let reset = PortAction::ResetAnnounceReceiptTimer {
                     duration: self.config.announce_duration(&mut self.rng),
-                }]
+                };
+
+                let propagate = PortAction::PropagateTlv {
+                    tlv_set: message.suffix,
+                    current_time: WireTimestamp::from(self.clock.now()),
+                };
+
+                match message.suffix.announce_propagate_tlv().count() {
+                    0 => actions![reset],
+                    _ => actions![reset, propagate],
+                }
             }
             _ => {
                 self.port_state
