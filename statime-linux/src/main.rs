@@ -565,7 +565,7 @@ async fn port_task_step<A: NetworkAddress + PtpTargetAddress>(
 
     loop {
         let mut actions = tokio::select! {
-            result = event_socket.recv(local_clock, &mut event_buffer) => match result {
+            result = event_socket.recv(&mut event_buffer) => match result {
                 Ok(packet) => port.handle_timecritical_receive(packet.data, packet.timestamp),
                 Err(error) => panic!("Error receiving: {error:?}"),
             },
@@ -600,7 +600,7 @@ async fn port_task_step<A: NetworkAddress + PtpTargetAddress>(
                 event_socket,
                 general_socket,
                 &mut next_tlv_set,
-                &mut timers,
+                timers,
             )
             .await;
 
