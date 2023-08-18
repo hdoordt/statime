@@ -302,7 +302,7 @@ async fn actual_main() {
     for port_config in config.ports {
         let interface = port_config.interface;
         let network_mode = port_config.network_mode;
-        let (port_clock, timestamping) = match &port_config.hardware_clock {
+        let (local_clock, timestamping) = match &port_config.hardware_clock {
             Some(path) => {
                 let clock = LinuxClock::open(path).expect("Unable to open clock");
                 if let Some(id) = clock_name_map.get(path) {
@@ -324,12 +324,12 @@ async fn actual_main() {
             }
         };
         let rng = StdRng::from_entropy();
-        let port = instance.add_port(port_config.into(), 0.25, port_clock, rng);
+        let port = instance.add_port(port_config.into(), 0.25, local_clock, rng);
 
         let (main_task_sender, port_task_receiver) = tokio::sync::mpsc::channel(1);
         let (port_task_sender, main_task_receiver) = tokio::sync::mpsc::channel(1);
 
-        let input = BmcaInput {
+        let input = PortTaskInput {
             port,
             tlv_set: Vec::new(),
         };
@@ -354,6 +354,7 @@ async fn actual_main() {
                     port_task_sender,
                     event_socket,
                     general_socket,
+                    local_clock.clone(),
                     bmca_notify_receiver.clone(),
                 ));
             }
@@ -368,6 +369,7 @@ async fn actual_main() {
                     port_task_sender,
                     event_socket,
                     general_socket,
+                    local_clock.clone(),
                     bmca_notify_receiver.clone(),
                 ));
             }
@@ -388,8 +390,8 @@ async fn actual_main() {
 async fn run(
     instance: &'static PtpInstance<BasicFilter>,
     bmca_notify_sender: tokio::sync::watch::Sender<bool>,
-    mut main_task_receivers: Vec<Receiver<BmcaOutput>>,
-    main_task_senders: Vec<Sender<BmcaInput>>,
+    mut main_task_receivers: Vec<Receiver<PortTaskOutput>>,
+    main_task_senders: Vec<Sender<PortTaskInput>>,
     internal_sync_senders: Vec<tokio::sync::watch::Sender<ClockSyncMode>>,
     clock_port_map: Vec<Option<usize>>,
 ) -> ! {
@@ -453,7 +455,7 @@ async fn run(
         let tlv: Vec<u8> = propagate.into_iter().flat_map(|tlv| tlv.bytes).collect();
 
         for (port, sender) in bmca_ports.into_iter().zip(main_task_senders.iter()) {
-            let input = BmcaInput {
+            let input = PortTaskInput {
                 port,
                 tlv_set: tlv.clone(),
             };
@@ -465,12 +467,12 @@ async fn run(
 
 type BmcaPort = Port<InBmca<'static>, StdRng, LinuxClock, BasicFilter>;
 
-struct BmcaInput {
+struct PortTaskInput {
     port: BmcaPort,
     tlv_set: Vec<u8>,
 }
 
-struct BmcaOutput {
+struct PortTaskOutput {
     port: BmcaPort,
     tlv_set: Vec<OwnedTlv>,
 }
@@ -489,10 +491,11 @@ struct OwnedTlv {
 // the task is notified of a BMCA, it will stop running, move the port into the
 // bmca state, and send it on its Sender
 async fn port_task<A: NetworkAddress + PtpTargetAddress>(
-    mut port_task_receiver: Receiver<BmcaInput>,
-    port_task_sender: Sender<BmcaOutput>,
+    mut port_task_receiver: Receiver<PortTaskInput>,
+    port_task_sender: Sender<PortTaskOutput>,
     mut event_socket: Socket<A, Open>,
     mut general_socket: Socket<A, Open>,
+    local_clock: LinuxClock,
     mut bmca_notify: tokio::sync::watch::Receiver<bool>,
 ) {
     let mut timers = Timers {
@@ -504,102 +507,114 @@ async fn port_task<A: NetworkAddress + PtpTargetAddress>(
     };
 
     loop {
-        let mut next_tlv_set = Vec::new();
+        let input = port_task_receiver.recv().await.unwrap();
 
-        let port_in_bmca = port_task_receiver.recv().await.unwrap();
-
-        // handle post-bmca actions
-        let (mut port, actions) = port_in_bmca.port.end_bmca();
-
-        // the first announce message will take (and clear) the tlv set
-        let mut current_tlv_set = TlvSet::new(&port_in_bmca.tlv_set);
-
-        let mut pending_timestamp = handle_actions(
-            actions,
+        let output = port_task_step(
+            input,
+            &mut timers,
             &mut event_socket,
             &mut general_socket,
-            &mut next_tlv_set,
-            &mut timers,
+            &local_clock,
+            &mut bmca_notify,
         )
         .await;
 
-        while let Some((context, timestamp)) = pending_timestamp {
-            pending_timestamp = handle_actions(
-                port.handle_send_timestamp(context, timestamp),
-                &mut event_socket,
-                &mut general_socket,
+        port_task_sender.send(output).await.unwrap();
+    }
+}
+
+async fn port_task_step<A: NetworkAddress + PtpTargetAddress>(
+    input: PortTaskInput,
+    timers: &mut Timers<'_>,
+    event_socket: &mut Socket<A, Open>,
+    general_socket: &mut Socket<A, Open>,
+    local_clock: &LinuxClock,
+    bmca_notify: &mut tokio::sync::watch::Receiver<bool>,
+) -> PortTaskOutput {
+    // handle post-bmca actions
+    let (mut port, actions) = input.port.end_bmca();
+
+    // the first announce message will take (and clear) the tlv set
+    let mut current_tlv_set = TlvSet::new(&input.tlv_set);
+
+    // TLVs that must be distributed to other ports on the next BMCA interval
+    let mut next_tlv_set = Vec::new();
+
+    let mut pending_timestamp = handle_actions(
+        actions,
+        event_socket,
+        general_socket,
+        &mut next_tlv_set,
+        timers,
+    )
+    .await;
+
+    while let Some((context, timestamp)) = pending_timestamp {
+        pending_timestamp = handle_actions(
+            port.handle_send_timestamp(context, timestamp),
+            event_socket,
+            general_socket,
+            &mut next_tlv_set,
+            timers,
+        )
+        .await;
+    }
+
+    let mut event_buffer = [0; MAX_DATA_LEN];
+    let mut general_buffer = [0; 2048];
+
+    loop {
+        let mut actions = tokio::select! {
+            result = event_socket.recv(local_clock, &mut event_buffer) => match result {
+                Ok(packet) => port.handle_timecritical_receive(packet.data, packet.timestamp),
+                Err(error) => panic!("Error receiving: {error:?}"),
+            },
+            result = general_socket.recv(&mut general_buffer) => match result {
+                Ok(packet) => port.handle_general_receive(packet.data),
+                Err(error) => panic!("Error receiving: {error:?}"),
+            },
+            () = &mut timers.port_announce_timer => {
+                port.handle_announce_timer(std::mem::take(&mut current_tlv_set))
+            },
+            () = &mut timers.port_sync_timer => {
+                port.handle_sync_timer()
+            },
+            () = &mut timers.port_announce_timeout_timer => {
+                port.handle_announce_receipt_timer()
+            },
+            () = &mut timers.delay_request_timer => {
+                port.handle_delay_request_timer()
+            },
+            () = &mut timers.filter_update_timer => {
+                port.handle_filter_update_timer()
+            },
+            result = bmca_notify.wait_for(|v| *v) => match result {
+                Ok(_) => break,
+                Err(error) => panic!("Error on bmca notify: {error:?}"),
+            }
+        };
+
+        loop {
+            let pending_timestamp = handle_actions(
+                actions,
+                event_socket,
+                general_socket,
                 &mut next_tlv_set,
                 &mut timers,
             )
             .await;
-        }
 
-        let mut event_buffer = [0; MAX_DATA_LEN];
-        let mut general_buffer = [0; 2048];
-
-        loop {
-            let mut actions = tokio::select! {
-                result = event_socket.recv(&mut event_buffer) => match result {
-                    Ok(packet) => {
-                        if let Some(timestamp) = packet.timestamp {
-                            log::trace!("Recv timestamp: {:?}", packet.timestamp);
-                            port.handle_timecritical_receive(&event_buffer[..packet.bytes_read], timestamp_to_time(timestamp))
-                        } else {
-                            log::error!("Missing recv timestamp");
-                            PortActionIterator::empty()
-                        }
-                    }
-                    Err(error) => panic!("Error receiving: {error:?}"),
-                },
-                result = general_socket.recv(&mut general_buffer) => match result {
-                    Ok(packet) => port.handle_general_receive(&general_buffer[..packet.bytes_read]),
-                    Err(error) => panic!("Error receiving: {error:?}"),
-                },
-                () = &mut timers.port_announce_timer => {
-                    port.handle_announce_timer(std::mem::take(&mut current_tlv_set))
-                },
-                () = &mut timers.port_sync_timer => {
-                    port.handle_sync_timer()
-                },
-                () = &mut timers.port_announce_timeout_timer => {
-                    port.handle_announce_receipt_timer()
-                },
-                () = &mut timers.delay_request_timer => {
-                    port.handle_delay_request_timer()
-                },
-                () = &mut timers.filter_update_timer => {
-                    port.handle_filter_update_timer()
-                },
-                result = bmca_notify.wait_for(|v| *v) => match result {
-                    Ok(_) => break,
-                    Err(error) => panic!("Error on bmca notify: {error:?}"),
-                }
+            // there might be more actions to handle based on the current action
+            actions = match pending_timestamp {
+                Some((context, timestamp)) => port.handle_send_timestamp(context, timestamp),
+                None => break,
             };
-
-            loop {
-                let pending_timestamp = handle_actions(
-                    actions,
-                    &mut event_socket,
-                    &mut general_socket,
-                    &mut next_tlv_set,
-                    &mut timers,
-                )
-                .await;
-
-                // there might be more actions to handle based on the current action
-                actions = match pending_timestamp {
-                    Some((context, timestamp)) => port.handle_send_timestamp(context, timestamp),
-                    None => break,
-                };
-            }
         }
+    }
 
-        let output = BmcaOutput {
-            port: port.start_bmca(),
-            tlv_set: Vec::new(),
-        };
-
-        port_task_sender.send(output).await.unwrap();
+    PortTaskOutput {
+        port: port.start_bmca(),
+        tlv_set: next_tlv_set,
     }
 }
 
@@ -661,15 +676,15 @@ async fn handle_actions<A: NetworkAddress + PtpTargetAddress>(
             PortAction::PropagateTlv {
                 tlv_set,
                 current_time,
-            } => {
-                // record so that they can be propagated
-                let new = OwnedTlv {
-                    timestamp: current_time.to_nanos(),
-                    bytes: tlv_set.as_slice().to_vec(),
-                };
+            } => tlv.extend(tlv_set.announce_propagate_tlv().map(|tlv| {
+                let mut bytes = Vec::with_capacity(128);
+                tlv.write_serialized(&mut bytes).expect("Vec can grow");
 
-                tlv.push(new)
-            }
+                OwnedTlv {
+                    timestamp: current_time.to_nanos(),
+                    bytes,
+                }
+            })),
         }
     }
 
