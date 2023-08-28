@@ -302,7 +302,7 @@ async fn actual_main() {
     for port_config in config.ports {
         let interface = port_config.interface;
         let network_mode = port_config.network_mode;
-        let (local_clock, timestamping) = match &port_config.hardware_clock {
+        let (port_clock, timestamping) = match &port_config.hardware_clock {
             Some(path) => {
                 let clock = LinuxClock::open(path).expect("Unable to open clock");
                 if let Some(id) = clock_name_map.get(path) {
@@ -324,7 +324,7 @@ async fn actual_main() {
             }
         };
         let rng = StdRng::from_entropy();
-        let port = instance.add_port(port_config.into(), 0.25, local_clock, rng);
+        let port = instance.add_port(port_config.into(), 0.25, port_clock, rng);
 
         let (main_task_sender, port_task_receiver) = tokio::sync::mpsc::channel(1);
         let (port_task_sender, main_task_receiver) = tokio::sync::mpsc::channel(1);
@@ -354,7 +354,6 @@ async fn actual_main() {
                     port_task_sender,
                     event_socket,
                     general_socket,
-                    local_clock.clone(),
                     bmca_notify_receiver.clone(),
                 ));
             }
@@ -369,7 +368,6 @@ async fn actual_main() {
                     port_task_sender,
                     event_socket,
                     general_socket,
-                    local_clock.clone(),
                     bmca_notify_receiver.clone(),
                 ));
             }
@@ -497,7 +495,6 @@ async fn port_task<A: NetworkAddress + PtpTargetAddress>(
     port_task_sender: Sender<PortTaskOutput>,
     mut event_socket: Socket<A, Open>,
     mut general_socket: Socket<A, Open>,
-    local_clock: LinuxClock,
     mut bmca_notify: tokio::sync::watch::Receiver<bool>,
 ) {
     let mut timers = Timers {
@@ -516,7 +513,6 @@ async fn port_task<A: NetworkAddress + PtpTargetAddress>(
             &mut timers,
             &mut event_socket,
             &mut general_socket,
-            &local_clock,
             &mut bmca_notify,
         )
         .await;
@@ -530,7 +526,6 @@ async fn port_task_step<A: NetworkAddress + PtpTargetAddress>(
     timers: &mut Timers<'_>,
     event_socket: &mut Socket<A, Open>,
     general_socket: &mut Socket<A, Open>,
-    local_clock: &LinuxClock,
     bmca_notify: &mut tokio::sync::watch::Receiver<bool>,
 ) -> PortTaskOutput {
     // handle post-bmca actions
@@ -568,11 +563,19 @@ async fn port_task_step<A: NetworkAddress + PtpTargetAddress>(
     loop {
         let mut actions = tokio::select! {
             result = event_socket.recv(&mut event_buffer) => match result {
-                Ok(packet) => port.handle_timecritical_receive(packet.data, packet.timestamp),
+                Ok(packet) => {
+                    if let Some(timestamp) = packet.timestamp {
+                        log::trace!("Recv timestamp: {:?}", packet.timestamp);
+                        port.handle_timecritical_receive(&event_buffer[..packet.bytes_read], timestamp_to_time(timestamp))
+                    } else {
+                        log::error!("Missing recv timestamp");
+                        PortActionIterator::empty()
+                    }
+                }
                 Err(error) => panic!("Error receiving: {error:?}"),
             },
             result = general_socket.recv(&mut general_buffer) => match result {
-                Ok(packet) => port.handle_general_receive(packet.data),
+                Ok(packet) => port.handle_general_receive(&general_buffer[..packet.bytes_read]),
                 Err(error) => panic!("Error receiving: {error:?}"),
             },
             () = &mut timers.port_announce_timer => {
